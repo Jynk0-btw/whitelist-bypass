@@ -1,3 +1,38 @@
+# Whitelist Bypass — сборка с правками под батарею
+
+> Это форк [kulikov0/whitelist-bypass](https://github.com/kulikov0/whitelist-bypass). Схему обхода придумал и написал [@kulikov0](https://github.com/kulikov0), здесь только правки энергопотребления iOS-клиента. Лицензия MIT, как у оригинала.
+
+## Скачать
+
+**[⬇ whitelist-bypass-proxy.ipa — последний релиз](https://github.com/Jynk0-btw/whitelist-bypass/releases/latest)**
+
+Неподписанная сборка, ставится через Sideloadly или AltStore. Всё остальное — сервер, Android, десктоп — берите из [оригинального репозитория](https://github.com/kulikov0/whitelist-bypass/releases), там ничего не менялось.
+
+## Что изменилось
+
+| | было | стало |
+|---|---|---|
+| Холостой ход туннеля | 2.95 % ядра | **0.15 %** |
+| Пробуждений в секунду на простое (VP8) | 648 | ~9 |
+| Пробуждений в секунду на простое (KCP) | 100 | 2 |
+| Период keepalive | 60–200 мс | 3–8 с, настраивается |
+| Лог | включён, будит главный поток | выключен |
+| Буфер фонового удержания | 44100 Гц | 8000 Гц |
+
+Появились два переключателя в настройках: **«Не публиковать видео (DC)»** — выключен по умолчанию, включать осознанно, и **«Без mDNS-кандидатов»** — включён.
+
+Разбор с замерами: **[BATTERY.md](BATTERY.md)**. Весь диф против оригинала: **[compare](https://github.com/kulikov0/whitelist-bypass/compare/main...Jynk0-btw:whitelist-bypass:battery-all)**.
+
+Правки разложены по веткам, каждая самодостаточна:
+
+- [`idle-wakeups`](https://github.com/Jynk0-btw/whitelist-bypass/tree/idle-wakeups) — оба холостых цикла плюс бенчмарк
+- [`tunnel-options`](https://github.com/Jynk0-btw/whitelist-bypass/tree/tunnel-options) — keepalive, DC без видеотрека, mDNS
+- [`ios-battery`](https://github.com/Jynk0-btw/whitelist-bypass/tree/ios-battery) — приложение
+
+Ветка `main` не тронута и совпадает с оригиналом.
+
+---
+
 # Whitelist Bypass
 
 Tunnels internet traffic through video calling platforms (VK Call, Yandex Telemost, WB Stream) to bypass government whitelist censorship.
