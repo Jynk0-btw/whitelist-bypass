@@ -75,9 +75,30 @@ Points 1 and 2 both go away with `NEPacketTunnelProvider`: a network extension g
 
 **The keepalive period was nailed shut.** `SetKeepaliveShape` existed but was never called from anywhere, so the period stayed at 60–200ms forever. It is now carried from the app into the tunnel and exposed in settings; the default is 3–8s.
 
-**The video track was always published.** `onLKReady` created a VP8 track and sent `AddTrack` unconditionally, and `startTunnel` started the writer unconditionally — the mode branch came only afterwards. In DC mode that entire path runs for nothing, since the payload travels over the data channel. `publishDataOnly` brings the publisher up with a data channel alone. **Off by default**: whether WB Stream accepts a participant without video can only be established against a live room.
+**The video track was always published.** `onLKReady` created a VP8 track and sent `AddTrack` unconditionally, and `startTunnel` started the writer unconditionally — the mode branch came only afterwards. In DC mode that entire path runs for nothing, since the payload travels over the data channel. `publishDataOnly` brings the publisher up with a data channel alone. It is off by default, but it has since been run against a live room: **WB Stream does accept a participant that publishes no track at all** (`sent publisher offer, data-only` → `pub PC state: connected` → `dc tunnel ready`).
 
 **Minor.** mDNS candidate gathering is off — the peer is always on the internet, so `.local` addresses are dead weight.
+
+## The other half: what the phone receives
+
+Everything above measures what the phone *sends*. That turned out to be the smaller half.
+
+WB Stream is a video calling service, and the tunnel works by behaving like a call: both ends join a room as participants and publish a video track. Once the phone runs in DC mode with the video track disabled, its own emission drops to nothing — but the creator on the server keeps publishing its track, with the idle keepalive still at the built-in 60–200ms, and the joiner subscribes to it because `auto_subscribe=1` is hardcoded into the join URL. That is roughly 7.7 packets per second arriving at the phone around the clock, purely to keep a track alive that carries nothing. It wakes the radio far more often than anything on the uplink does.
+
+So the CLI creator got the same three knobs the app has:
+
+```
+headless-wbstream-creator --cookies ck.json --room wbstream://<id> \
+  --keepalive 3000,8000 --mode dc --skip-video
+```
+
+- `-keepalive min,max` — idle keepalive period in milliseconds, empty keeps the 60–200ms default
+- `-mode dc|video` — pin the tunnel mode instead of auto-detecting it
+- `-skip-video` — publish no video track at all; requires `-mode dc` and a joiner in DC mode
+
+With `-skip-video` there is no inbound RTP left. Measured on a live room: the tunnel came up in DC mode as usual, 90 relayed connections in the first two minutes with zero `EOF with no data read`, and the creator's own CPU went from 2.2% to 0.4%.
+
+What still wakes the radio, and cannot be tuned away from here: ICE consent keepalive every 2 seconds (pion's default) and the LiveKit ping every 5 seconds. Raising the ICE interval is possible through `SetICETimeouts`, but carrier NAT drops idle UDP bindings after 30–120 seconds while pion gives up after 5, so that trade is not obviously worth making.
 
 ## Branches
 
