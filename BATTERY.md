@@ -1,18 +1,18 @@
-# Расход батареи на iPhone: что нашлось и что сделано
+# Battery drain on iPhone: what was wrong and what changed
 
-Форк [kulikov0/whitelist-bypass](https://github.com/kulikov0/whitelist-bypass) (MIT). Схему обхода придумал и написал [@kulikov0](https://github.com/kulikov0) — здесь только правки под энергопотребление iOS-клиента.
+A fork of [kulikov0/whitelist-bypass](https://github.com/kulikov0/whitelist-bypass) (MIT). The bypass itself was designed and written by [@kulikov0](https://github.com/kulikov0); this fork only touches power consumption in the iOS client.
 
-Базовый коммит `0f9f908`, версия приложения 0.3.8.
+Base commit `0f9f908`, app version 0.3.8.
 
-## Главное: два цикла будили процессор впустую
+## Two loops spun the CPU for nothing
 
-**Писатель VP8.** Темп кадров считается как `sampleInterval = (1s / fps) / pacedBatch`. При дефолтных `fps=24`, `batch=30` это **1.54 мс**, то есть тикер срабатывает 648 раз в секунду. Лог подтверждает дословно:
+**The VP8 writer.** Frame pacing is `sampleInterval = (1s / fps) / pacedBatch`, so the defaults `fps=24`, `batch=30` give **1.54ms** — the ticker fires 648 times a second. The log says it outright:
 
 ```
 vp8tunnel: writer (re)started fps=24 batch=30 pacedBatch=27 sampleInterval=1.543209ms keepaliveEvery=70
 ```
 
-Когда отправлять нечего, цикл всё равно просыпался на каждый тик — и просто увеличивал счётчик:
+With nothing to send the loop still woke on every tick, only to bump a counter:
 
 ```go
 default:
@@ -22,72 +22,66 @@ default:
     }
 ```
 
-Реальный кадр уходит раз в 70 тиков, примерно 9 раз в секунду. Остальные **639 пробуждений в секунду не делали ничего**, но не давали процессору уйти в глубокий сон. С `dualTrack` таких писателей два.
+A real frame goes out once every 70 ticks, about nine times a second. The other **639 wakeups per second did nothing** except keep the core out of deep sleep. With `dualTrack` there are two such writers.
 
-**Обновление KCP.** При включённом Reliable KCP `updateLoop` дёргал `Update()` через фиксированный тикер на 10 мс — **100 раз в секунду независимо от трафика**. На простое ретранслировать нечего: `WaitSnd()` по всем сессиям равен нулю.
+**The KCP update loop.** With Reliable KCP enabled, `updateLoop` called `Update()` on a fixed 10ms ticker — **100 times a second regardless of traffic**. While idle there is nothing to retransmit: `WaitSnd()` is zero across every session.
 
-Оба цикла переведены на два темпа. Пока данные идут — прежнее поведение, форма трафика не меняется. На простое тикер гасится и горутина засыпает; отправка и приём будят её немедленно, поэтому задержка первого пакета после тишины не растёт.
+Both loops now run at two cadences. While data flows the behaviour is unchanged and the traffic shape is identical. Once idle the ticker stops and the goroutine blocks; sends and receives wake it immediately, so the first packet after silence is not delayed.
 
-### Замер процессорного времени
+## Measurements
 
-`relay/benchidle`, один трек, 30 секунд чистого простоя:
+Two things matter separately: CPU time, and how many packets actually go on the wire. On a phone the second one dominates — every frame is a packet that keeps the radio out of sleep.
 
-| | было | стало |
+`relay/tunnel/idle_rate_test.go`, single track, 30s of pure idle:
+
+| | frames/s | CPU (share of one core) |
 |---|---|---|
-| vp8 только | 2.47 % ядра | 0.14 % |
-| vp8 + Reliable KCP | 2.95 % ядра | 0.15 % |
+| original | 7.9 | 2.155 % |
+| patched, same keepalive | 7.7 | 0.154 % |
+| patched, keepalive 3–8s | **0.2** | **0.007 %** |
 
-Нижняя строка — типичная конфигурация мобильного клиента. Бенчмарк лежит в репозитории и прогоняется на исходном и пропатченном дереве:
+Reproduce it on either tree:
 
 ```sh
-cd relay && withKCP=1 go run ./benchidle/
+cd relay
+go test ./tunnel/ -run TestIdleEmissionRate -v
+KEEPALIVE_MS=3000,8000 go test ./tunnel/ -run TestIdleEmissionRate -v
 ```
 
-## Почему процессор — не главный расход
+The middle row is the honest limit of the loop fix on its own: CPU drops 14x, **but the packet rate barely moves**. Idle traffic is driven by the keepalive period, not by the ticker. That is why the keepalive knob matters more for battery than the loop rewrite does — together they take idle emissions from ~8 packets per second down to one every five seconds.
 
-Цифра «в 20 раз меньше» относится только к вычислениям, и её легко переоценить. Ядро процессора под нагрузкой 3 % съедает единицы-десятки милливатт — на фоне телефона это немного.
+CPU-only comparison including the KCP loop, from `relay/benchidle`:
 
-Основной расход у туннеля другой:
+| | before | after |
+|---|---|---|
+| vp8 only | 2.47 % | 0.14 % |
+| vp8 + Reliable KCP | 2.95 % | 0.15 % |
 
-1. **Радио.** Клиент постоянно шлёт мелкие пакеты, и модем не уходит в спящее состояние. До правок в тишину улетало ~9 кадров в секунду.
-2. **Аудиосессия.** Приложение крутит беззвучный поток, чтобы iOS не усыпила процесс — подсистема звука не выключается никогда.
-3. **Два процесса.** Трафик идёт через приложение-прокси и второе приложение поверх него, каждый пакет копируется между ними.
+These are wire-level and CPU-level numbers. **Battery life in hours was not measured** — that needs the device, not a build machine.
 
-Поэтому самые перспективные правки здесь — **разреженный keepalive** и **отказ от видеотрека**: они бьют по пункту 1. Пункты 2 и 3 закрываются только переходом на `NEPacketTunnelProvider`, что упирается в платный Apple Developer.
+## What is left untouched, and why
 
-### Как померить у себя
+Three things still drive drain and none of them are fixable here:
 
-Замера в часах работы здесь нет — для этого нужен телефон, а не сборочная машина.
+1. **The silent audio session.** The app loops a silent buffer so iOS does not suspend it (`UIBackgroundModes: audio`), which keeps the audio subsystem alive around the clock. The buffer was generated at 44100Hz and is now 8000Hz — 5.5x fewer samples — but the session itself stays open.
+2. **Two processes.** Traffic passes through this proxy app and a second client app on top of it, so every packet is copied between them.
+3. **The LiveKit websocket ping** every 5 seconds. The interval is dictated by the server in its join response; shortening or dropping it gets the connection closed.
 
-Быстрее и точнее всего через Xcode: подключить устройство, запустить сборку и открыть **Debug navigator → Energy Impact**. Там видно раздельно, сколько тратится на процессор, сколько на сеть и сколько на «overhead» от того, что приложение не даёт системе спать.
+Points 1 and 2 both go away with `NEPacketTunnelProvider`: a network extension gets legitimate background execution and can route traffic itself. It requires a paid Apple Developer account — the network extension entitlement cannot be signed with a free Apple ID, and sideloading through AltStore does not change that.
 
-Грубее, но без Xcode: Настройки → Аккумулятор → разбивка по приложениям за сутки. Смотреть надо оба приложения — и сам прокси, и клиент поверх него. Менять по одному переключателю за раз, иначе непонятно, что дало эффект.
+## The rest of the changes
 
-## Остальные правки
+**Logging burned the main thread.** `onLog` is called from Go for every line, and an active tunnel produces hundreds per minute. Each one printed through `print()` in release builds too, hopped to the main thread, and mutated a `@Published` array — so SwiftUI recomputed the view even with the log collapsed and nobody watching. `showLogs` also defaulted to on.
 
-**Лог жёг главный поток.** `onLog` вызывается из Go на каждую строку, а строк на живом туннеле сотни в минуту. Каждая печаталась через `print()` (в релизе тоже), уходила в `DispatchQueue.main.async` и мутировала `@Published logs` — SwiftUI пересчитывал вью даже при свёрнутом логе. Умолчание `showLogs` при этом было включено.
+**The keepalive period was nailed shut.** `SetKeepaliveShape` existed but was never called from anywhere, so the period stayed at 60–200ms forever. It is now carried from the app into the tunnel and exposed in settings; the default is 3–8s.
 
-**Keepalive был прибит гвоздями.** `SetKeepaliveShape` в коде существовал, но не вызывался ниоткуда, так что период всегда оставался 60–200 мс. Период выведен в настройки, умолчание поднято до 3–8 с.
+**The video track was always published.** `onLKReady` created a VP8 track and sent `AddTrack` unconditionally, and `startTunnel` started the writer unconditionally — the mode branch came only afterwards. In DC mode that entire path runs for nothing, since the payload travels over the data channel. `publishDataOnly` brings the publisher up with a data channel alone. **Off by default**: whether WB Stream accepts a participant without video can only be established against a live room.
 
-**Видеотрек публиковался всегда.** `onLKReady` создавал VP8-трек и слал `SendAddTrack` безусловно, `startTunnel` безусловно поднимал писателя — ветвление по режиму шло только после. В DC-режиме весь тракт работает вхолостую: данные едут по data channel. Добавлен путь `publishDataOnly`. **Выключено по умолчанию**: примет ли WB Stream участника без видеодорожки, выясняется только живьём.
+**Minor.** mDNS candidate gathering is off — the peer is always on the internet, so `.local` addresses are dead weight.
 
-**Мелочи.** Сбор mDNS-кандидатов выключен — пир всегда в интернете, `.local` бесполезны. Беззвучный буфер фонового удержания снижен с 44100 до 8000 Гц.
+## Branches
 
-## Что проверено, а что нет
-
-- Go-часть собирается (`go build ./...`) и проходит `go vet`.
-- Цифры выше — замер процессорного времени цикла, а **не замер батареи**.
-- Правки в приложении проверены сборкой и живым использованием, по отдельности не измерялись.
-
-## Что осталось за бортом
-
-**`NEPacketTunnelProvider` вместо тишины в фоне.** Сетевое расширение получило бы законное фоновое исполнение, а заодно убрало бы из цепочки второе приложение. Упирается в платный Apple Developer: бесплатной подписью entitlement сетевого расширения не подписать.
-
-**Пинг LiveKit раз в 5 секунд** трогать нельзя — интервал диктует сервер в ответе на join.
-
-## Ветки
-
-- [`idle-wakeups`](https://github.com/Jynk0-btw/whitelist-bypass/tree/idle-wakeups) — оба холостых цикла плюс бенчмарк
-- [`tunnel-options`](https://github.com/Jynk0-btw/whitelist-bypass/tree/tunnel-options) — настраиваемый keepalive, DC без видеотрека, отключение mDNS
-- [`ios-battery`](https://github.com/Jynk0-btw/whitelist-bypass/tree/ios-battery) — правки приложения
-- `battery-all` — всё вместе, отсюда собирается `.ipa`
+- [`idle-wakeups`](https://github.com/Jynk0-btw/whitelist-bypass/tree/idle-wakeups) — both idle loops plus the measurement test
+- [`tunnel-options`](https://github.com/Jynk0-btw/whitelist-bypass/tree/tunnel-options) — tunable keepalive, DC without a video track, mDNS toggle
+- [`ios-battery`](https://github.com/Jynk0-btw/whitelist-bypass/tree/ios-battery) — the app changes
+- `battery-all` — everything together; the `.ipa` is built from here
