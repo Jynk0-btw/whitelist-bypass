@@ -1,12 +1,14 @@
 # Whitelist Bypass — battery build
 
-> A fork of [kulikov0/whitelist-bypass](https://github.com/kulikov0/whitelist-bypass). The bypass itself was designed and written by [@kulikov0](https://github.com/kulikov0); this fork only reworks power consumption in the iOS client. MIT, same as upstream.
+> A fork of [kulikov0/whitelist-bypass](https://github.com/kulikov0/whitelist-bypass). The bypass itself was designed and written by [@kulikov0](https://github.com/kulikov0); this fork only reworks power consumption — in the iOS client and in the headless creator that feeds it. MIT, same as upstream.
 
 ## Download
 
 **[⬇ whitelist-bypass-proxy.ipa — latest release](https://github.com/Jynk0-btw/whitelist-bypass/releases/latest)**
 
-Unsigned build, install with Sideloadly or AltStore. Everything else — server, Android, desktop — is unchanged; take it from the [upstream releases](https://github.com/kulikov0/whitelist-bypass/releases).
+Unsigned build, install with Sideloadly or AltStore.
+
+The headless WB Stream creator has changed too — it gained flags that stop it from streaming into an idle tunnel (see below). Build it from this fork with `./build-headless.sh`. Android and desktop are untouched; take those from the [upstream releases](https://github.com/kulikov0/whitelist-bypass/releases).
 
 ## What changed
 
@@ -21,14 +23,23 @@ Idle traffic drops ~40x and CPU ~300x. Two fixed-rate tickers no longer spin wit
 
 Also: logging no longer wakes the main thread on every line from Go and is off by default; the silent background buffer dropped from 44100Hz to 8000Hz.
 
-Two new switches in settings: **"No video track (DC)"**, off by default — enable deliberately, the tunnel will not come up if the platform rejects a participant without video — and **"No mDNS candidates"**, on.
+Two new switches in settings: **"No video track (DC)"**, off by default, and **"No mDNS candidates"**, on. The first one has since been run against a live WB Stream room — the platform does accept a participant that publishes no track at all.
+
+**The server side matters just as much.** These platforms are video calling services, and the tunnel works by acting like a call: both ends join a room and publish a video track. Turn video off on the phone and its own emission goes to zero — but the creator keeps publishing its track with the built-in 60–200ms idle keepalive, and joiners subscribe to everything in the room, so ~7.7 packets/s keep arriving and keep the radio awake. The WB Stream creator therefore takes the same knobs the app has:
+
+```sh
+headless-wbstream-creator --cookies ck.json --room wbstream://<id> \
+  --keepalive 3000,8000 --mode dc --skip-video
+```
+
+With `--skip-video` there is no inbound RTP left at all. What remains below that is not tunable from here: ICE consent keepalive every 2s and the LiveKit ping every 5s, whose interval the server dictates.
 
 Full write-up with the reasoning: **[BATTERY.md](BATTERY.md)**. Complete diff against upstream: **[compare](https://github.com/kulikov0/whitelist-bypass/compare/main...Jynk0-btw:whitelist-bypass:battery-all)**.
 
 Changes are split into self-contained branches:
 
 - [`idle-wakeups`](https://github.com/Jynk0-btw/whitelist-bypass/tree/idle-wakeups) — both idle loops plus the measurement test
-- [`tunnel-options`](https://github.com/Jynk0-btw/whitelist-bypass/tree/tunnel-options) — keepalive, DC without a video track, mDNS
+- [`tunnel-options`](https://github.com/Jynk0-btw/whitelist-bypass/tree/tunnel-options) — keepalive, DC without a video track, mDNS, and the matching creator flags
 - [`ios-battery`](https://github.com/Jynk0-btw/whitelist-bypass/tree/ios-battery) — the app
 
 `main` is untouched and tracks upstream.
@@ -228,6 +239,11 @@ All four creators need cookies exported from the desktop creator app (`Export Co
 | `--read-buf <bytes>` | yes | yes | yes | DC/RTP read buffer; only consulted with `--resources custom` |
 | `--max-dc-buf <bytes>` | yes | - | - | DataChannel `BufferedAmountLowThreshold`; only with `--resources custom` |
 | `--mem-limit <bytes>` | yes | yes | yes | Go soft memory limit (`debug.SetMemoryLimit`); only with `--resources custom` |
+| `--keepalive <min,max>` | - | - | yes | idle keepalive frame period in milliseconds, e.g. `3000,8000`; unset keeps the 60–200ms default |
+| `--mode <dc\|video>` | - | - | yes | pin the tunnel mode instead of auto-detecting it from the joiner |
+| `--skip-video` | - | - | yes | publish no video track at all; requires `--mode dc` and a joiner in DC mode |
+
+The last three cut what the creator sends to the joiner while idle — see [BATTERY.md](BATTERY.md). `--skip-video` removes the published track entirely, so a joiner running in Video mode can no longer attach.
 
 #### Joining an existing call
 
